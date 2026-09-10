@@ -67,6 +67,6 @@
 ## Static Release Contract
 
 - `ci/release.Dockerfile` builds Linux/amd64 musl artifacts with the pinned Rust image and `Cargo.lock`. Keep static ELF checks and empty-root smoke tests mandatory for packaging.
-- `ci/package-release.py` defines archive names and provenance. Keep these synchronized with sandboxd's shared installer and runtime manifest; AKernel consumes those through its sandboxd submodule.
+- `ci/package-release.py` defines archive names and provenance. Keep these synchronized with AKernel's `builder/scripts/install-distill-fs.sh` and `builder/distill-fs-versions.env`.
 - Version tags must match `Cargo.toml` and point to commits on `main`. The workflow publishes already-tested bytes and must not overwrite release assets.
 - Publish a release before updating consumer checksum pins. Do not use guessed digests or present locally rebuilt artifacts as published binaries.
