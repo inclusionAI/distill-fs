@@ -716,3 +716,14 @@ fn test_access_update_yields_to_high_priority_and_no_checksums_lost() {
         thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn test_concurrent_reader_shutdown() {
+    for _ in 0..128 {
+        let temp = tempfile::tempdir().unwrap();
+        let db = ChunkDB::new(temp.path()).unwrap();
+        crate::backend::check_concurrent_reader_shutdown(db, |db| {
+            assert!(!db.has_chunk(&CheckSum::empty()).unwrap());
+        });
+    }
+}

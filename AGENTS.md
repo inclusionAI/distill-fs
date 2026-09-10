@@ -70,3 +70,8 @@
 - `ci/package-release.py` defines archive names and provenance. Keep these synchronized with AKernel's `builder/scripts/install-distill-fs.sh` and `builder/distill-fs-versions.env`.
 - Version tags must match `Cargo.toml` and point to commits on `main`. The workflow publishes already-tested bytes and must not overwrite release assets.
 - Publish a release before updating consumer checksum pins. Do not use guessed digests or present locally rebuilt artifacts as published binaries.
+
+## LMDB Reader Lifetime
+
+- Open both chunk and index environments with `read_txn_without_tls()` and retain the `Env<WithoutTls>` types. Reader slots must be released with transactions: musl thread-exit TLS destructors can race with environment teardown and access an unmapped LMDB reader table.
+- Keep concurrent reader shutdown coverage for both databases when changing their lifecycle.

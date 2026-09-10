@@ -14,7 +14,7 @@
 
 use crate::backend::chunkdb::{CheckSum, CheckSumOnDisk, LMDB_MAX_READERS, MAX_DBS};
 use bytemuck::{Pod, Zeroable};
-use heed::{BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions};
+use heed::{BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions, WithoutTls};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::path::Path;
@@ -27,7 +27,7 @@ pub(crate) const DEFAULT_DATA_ID: [u8; 32] = [0_u8; 32];
 
 #[derive(Debug)]
 pub struct IndexDB {
-    pub(crate) env: Env,
+    pub(crate) env: Env<WithoutTls>,
     pub(crate) storage: Database<DedupRange, DedupInfo>,
 }
 
@@ -35,7 +35,10 @@ impl IndexDB {
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let open_begin = Instant::now();
         let env = unsafe {
+            // Release reader slots with their transactions. A TLS destructor
+            // can race environment teardown when worker threads exit on musl.
             EnvOpenOptions::new()
+                .read_txn_without_tls()
                 .map_size(META_DB_SIZE)
                 .max_readers(LMDB_MAX_READERS)
                 .max_dbs(MAX_DBS)
@@ -92,6 +95,17 @@ impl IndexDB {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_concurrent_reader_shutdown() {
+        for _ in 0..128 {
+            let temp = TempDir::new().unwrap();
+            let db = IndexDB::open(temp.path()).unwrap();
+            crate::backend::check_concurrent_reader_shutdown(db, |db| {
+                db.env.read_txn().unwrap().commit().unwrap();
+            });
+        }
+    }
 
     #[test]
     fn test_open_sets_configured_max_readers() {
