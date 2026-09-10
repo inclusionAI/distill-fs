@@ -15,7 +15,7 @@
 use crate::rate_limited_log;
 use crate::utils::RateLimitedLog;
 use fuse_backend_rs::api::filesystem::ZeroCopyWriter;
-use heed::{Env, RwTxn};
+use heed::{Env, RwTxn, WithoutTls};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,7 +31,10 @@ const WRITE_TXN_SLOW_THRESHOLD: Duration = Duration::from_secs(1);
 
 static SLOW_WRITE_TXN_LOG: RateLimitedLog = RateLimitedLog::new(30);
 
-pub(crate) fn slow_write_txn<'e>(env: &'e Env, caller: &str) -> heed::Result<RwTxn<'e>> {
+pub(crate) fn slow_write_txn<'e>(
+    env: &'e Env<WithoutTls>,
+    caller: &str,
+) -> heed::Result<RwTxn<'e>> {
     let t = Instant::now();
     let txn = env.write_txn()?;
     let elapsed = t.elapsed();
@@ -78,5 +81,27 @@ impl<T: Backend> Backend for Arc<T> {
 impl<T: BackendEx> BackendEx for Arc<T> {
     fn invalidate_chunk(&self, chunk_id: usize) -> std::io::Result<()> {
         (**self).invalidate_chunk(chunk_id)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn check_concurrent_reader_shutdown<T: Send + Sync + 'static>(db: T, read: fn(&T)) {
+    let db = Arc::new(db);
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                read(&db);
+                // All transactions finish before the last reader drops the
+                // database, concurrently with the other threads' TLS cleanup.
+                barrier.wait();
+            })
+        })
+        .collect();
+    drop(db);
+    for reader in readers {
+        reader.join().unwrap();
     }
 }

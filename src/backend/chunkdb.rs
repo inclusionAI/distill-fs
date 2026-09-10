@@ -15,7 +15,10 @@
 use super::slow_write_txn;
 use crate::utils::now_epoch_secs;
 use bytemuck::{Pod, Zeroable};
-use heed::{BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions, MdbError, RwTxn};
+use heed::{
+    BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions, MdbError, RwTxn,
+    WithoutTls,
+};
 use heed_types::Bytes;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
@@ -393,7 +396,7 @@ type ChunkAccessDb = Database<CheckSumOnDisk, AccessTime>;
 type ChunkAccessIndexDb = Database<AccessKey, Bytes>;
 
 pub struct ChunkDB {
-    env: Env,
+    env: Env<WithoutTls>,
     data_db: ChunkDataDb,
     #[cfg_attr(not(test), allow(dead_code))]
     access_db: ChunkAccessDb,
@@ -499,7 +502,7 @@ impl WriterChannel {
 }
 
 struct WriterThread {
-    env: Env,
+    env: Env<WithoutTls>,
     data_db: ChunkDataDb,
     access_db: ChunkAccessDb,
     access_index: ChunkAccessIndexDb,
@@ -779,7 +782,10 @@ impl ChunkDB {
         let meter = global::meter("distill_fs.chunkdb");
         let open_begin = Instant::now();
         let env = unsafe {
+            // Release reader slots with their transactions. A TLS destructor
+            // can race environment teardown when worker threads exit on musl.
             EnvOpenOptions::new()
+                .read_txn_without_tls()
                 .map_size(CHUNK_DB_SIZE)
                 .max_readers(LMDB_MAX_READERS)
                 .max_dbs(MAX_DBS)
@@ -823,7 +829,7 @@ impl ChunkDB {
     }
 
     fn open_or_create_databases(
-        env: &Env,
+        env: &Env<WithoutTls>,
     ) -> anyhow::Result<(ChunkDataDb, ChunkAccessDb, ChunkAccessIndexDb)> {
         // Try read transaction first to avoid blocking on the write mutex
         // when another process (e.g. GC) holds a write transaction.
@@ -1222,7 +1228,7 @@ impl ChunkDB {
     }
 
     fn spawn_writer_thread(
-        env: Env,
+        env: Env<WithoutTls>,
         data_db: ChunkDataDb,
         access_db: ChunkAccessDb,
         access_index: ChunkAccessIndexDb,
