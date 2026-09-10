@@ -63,3 +63,10 @@
 - When resolving a skill, check the current project first, then the global Codex configuration directory.
 - Project-local skills live under `.codex/skills/` in this repository and take precedence when a skill with the same name exists in multiple locations.
 - If the skill is not present in the project, fall back to `$CODEX_HOME/skills/` (for example, `~/.codex/skills/`).
+
+## Static Release Contract
+
+- `ci/release.Dockerfile` builds Linux/amd64 musl artifacts with the pinned Rust image and `Cargo.lock`. Keep static ELF checks and empty-root smoke tests mandatory for packaging.
+- `ci/package-release.py` defines archive names and provenance. Keep these synchronized with AKernel's `builder/scripts/install-distill-fs.sh` and `builder/distill-fs-versions.env`.
+- Version tags must match `Cargo.toml` and point to commits on `main`. The workflow publishes already-tested bytes and must not overwrite release assets.
+- Publish a release before updating consumer checksum pins. Do not use guessed digests or present locally rebuilt artifacts as published binaries.
