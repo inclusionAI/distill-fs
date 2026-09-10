@@ -1,0 +1,96 @@
+name: Static binary
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+          with open("Cargo.toml", "rb") as source:
+              version = tomllib.load(source)["package"]["version"]
+          tag = os.environ["RELEASE_TAG"]
+          assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?", tag), tag
+          assert tag == f"v{version}", "tag must match Cargo.toml"
+          PY
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Test musl build
+        run: docker build --platform linux/amd64 --target test -f ci/release.Dockerfile -t distill-fs-static-test .
+      - name: Test raw and Nydus FUSE mounts
+        run: |
+          sudo modprobe fuse
+          test -c /dev/fuse
+          mkdir -p target/release-test-tools
+          curl -fSL --retry 5 \
+            https://github.com/dragonflyoss/nydus/releases/download/v2.4.0/nydus-static-v2.4.0-linux-amd64.tgz \
+            -o target/release-test-tools/nydus.tgz
+          echo "e4f7de672ced6031c13c3c38a599993f8a8103b0cf85f9b0783f5f5fa7c8b3dc  target/release-test-tools/nydus.tgz" | sha256sum -c -
+          tar -xzf target/release-test-tools/nydus.tgz -C target/release-test-tools
+          docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+            --security-opt apparmor=unconfined --network none \
+            -v "$PWD/target/release-test-tools/nydus-static:/nydus:ro" \
+            -e DISTILL_FS_NYDUS_IMAGE=/nydus/nydus-image \
+            distill-fs-static-test cargo test --locked --release \
+            --target x86_64-unknown-linux-musl --test mount -- --ignored
+      - name: Build release archive and verify static executable
+        run: |
+          docker build --platform linux/amd64 -f ci/release.Dockerfile \
+            --build-arg "SOURCE_REVISION=$(git rev-parse HEAD)" \
+            --output type=local,dest=dist .
+          cd dist
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distill-fs-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: distill-fs-linux-amd64
+          path: dist
+      - name: Publish tested bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+          prerelease=()
+          if [[ "$RELEASE_TAG" == *-rc.* ]]; then prerelease=(--prerelease); fi
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "distill-fs $RELEASE_TAG" --generate-notes \
+            "${prerelease[@]}" distill-fs-*.tar.gz SHA256SUMS

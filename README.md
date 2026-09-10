@@ -82,6 +82,28 @@ Run the CLI help:
 cargo run --bin distill_fs -- --help
 ```
 
+## Static releases
+
+GitHub releases provide `distill-fs-vX.Y.Z-linux-amd64.tar.gz` and `SHA256SUMS`. The archive contains the `distill_fs` executable, `manifest.json`, `LICENSE`, `NOTICE`, and the exact `Cargo.lock`. The executable uses musl and has no dynamic loader or shared-library dependencies. Mounting still requires Linux FUSE support and suitable privileges; remote HTTPS backends still need a CA certificate store on the host.
+
+The first release is pending publication. Once published, download from `https://github.com/inclusionAI/distill-fs/releases/download/vX.Y.Z/`, verify the archive against a reviewed SHA-256 pin, extract it, and install `distill_fs` on `PATH`. Keep the license and provenance files with the binary. Production consumers must pin the release URL and checksum in source control; fetching a checksum alongside an unpinned binary is not an independent integrity check.
+
+Build and test the same Linux/amd64 artifact locally with Docker:
+
+```bash
+docker build --platform linux/amd64 --target test -f ci/release.Dockerfile .
+docker build --platform linux/amd64 -f ci/release.Dockerfile \
+  --build-arg "SOURCE_REVISION=$(git rev-parse HEAD)" \
+  --output type=local,dest=dist .
+(cd dist && sha256sum -c SHA256SUMS)
+```
+
+Use a clean source checkout for release builds. `manifest.json` records the package version, source commit, musl target, and binary SHA-256. The Docker build checks the ELF for a dynamic interpreter and shared dependencies, then runs the executable in an empty chroot. The test target runs the default test suite against the musl release build; ignored FUSE tests need an explicitly privileged test environment. The pinned build image and `Cargo.lock` fix the toolchain and Rust dependency graph; Alpine build packages are resolved when the build runs, so independently rebuilding a tag is not a byte-for-byte reproducibility guarantee.
+
+The `Static binary` workflow builds and tests pull requests, `main`, manual runs, and version tags, including real raw and RAFS v5 FUSE mount tests using the checksum-pinned Nydus v2.4.0 tool. Non-tag runs upload a reviewable Actions artifact without publishing a release. To publish, update the package version and lockfile, merge to `main`, and push a matching `vX.Y.Z` tag (or `vX.Y.Z-rc.N` for a prerelease). The workflow rejects version mismatches and tags outside `main`, then publishes the tested archive without rebuilding in the release job. Existing release assets are never overwritten. Review changes before pushing a release tag.
+
+AKernel and sandboxd's dedicated image-manager integration test consume this archive through sandboxd's `third_party/runtime-versions.env` and `tools/install-distill-fs.sh`. Publish the distill-fs release first, verify its checksum, update the sandboxd pin, and then advance AKernel's sandboxd gitlink. The distill-fs submodule in AKernel is optional source reference and is no longer a build input.
+
 ## CLI Overview
 
 The main binary exposes four subcommands:
