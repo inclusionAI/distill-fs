@@ -36,7 +36,8 @@ struct MockBackend {
 struct MockBackendState {
     data: HashMap<usize, u8>,
     size: u64,
-    fetch_calls: u64,
+    foreground_thread: std::thread::ThreadId,
+    foreground_fetch_calls: u64,
     invalidate_calls: Vec<usize>,
 }
 
@@ -52,7 +53,8 @@ impl MockBackend {
             state: Arc::new(Mutex::new(MockBackendState {
                 data,
                 size,
-                fetch_calls: 0,
+                foreground_thread: std::thread::current().id(),
+                foreground_fetch_calls: 0,
                 invalidate_calls: vec![],
             })),
         }
@@ -66,7 +68,11 @@ impl Backend for MockBackend {
 
     fn fetch(&self, off: usize, data: &mut [u8]) -> io::Result<usize> {
         let mut state = self.state.lock().unwrap();
-        state.fetch_calls += 1;
+        // Reads also enqueue background dedup/sync work. Count only calls
+        // from the test thread so assertions do not depend on scheduling.
+        if std::thread::current().id() == state.foreground_thread {
+            state.foreground_fetch_calls += 1;
+        }
 
         if off >= state.size as usize {
             return Ok(0);
@@ -247,14 +253,14 @@ fn test_dedup_and_fetch_simple() {
         .dedup(off as u64, len as u32, None, CheckSumMethod::Blake3)
         .unwrap();
 
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 1);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 1);
 
     let mut buf = vec![0; len as usize];
     dedup.fetch(off as usize, &mut buf).unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 1);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 1);
 
     let mut original_data = vec![0; len as usize];
-    backend.state.lock().unwrap().fetch_calls = 0;
+    backend.state.lock().unwrap().foreground_fetch_calls = 0;
     backend.fetch(off as usize, &mut original_data).unwrap();
     assert_eq!(buf, original_data);
 }
@@ -401,12 +407,12 @@ fn test_deduplication_prevents_refetch() {
     dedup
         .dedup(off1, len as u32, None, CheckSumMethod::Sha256)
         .unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 1);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 1);
 
     dedup
         .dedup(off2, len as u32, None, CheckSumMethod::Sha256)
         .unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 2);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 2);
 
     let mut buf1 = vec![0; len as usize];
     let mut buf2 = vec![0; len as usize];
@@ -416,7 +422,7 @@ fn test_deduplication_prevents_refetch() {
 
     assert_eq!(buf1, data_to_write);
     assert_eq!(buf2, data_to_write);
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 2);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 2);
 }
 
 #[test]
@@ -426,22 +432,20 @@ fn test_fetch_mixed_data() {
     dedup
         .dedup(0, CHUNK_SIZE as u32, None, CheckSumMethod::Blake3)
         .unwrap();
-    let initial_fetch_count = backend.state.lock().unwrap().fetch_calls;
+    let initial_fetch_count = backend.state.lock().unwrap().foreground_fetch_calls;
     assert_eq!(initial_fetch_count, 1);
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    backend.state.lock().unwrap().fetch_calls = 0;
+    backend.state.lock().unwrap().foreground_fetch_calls = 0;
 
     let fetch_off = CHUNK_SIZE / 2;
     let fetch_len = CHUNK_SIZE;
     let mut buf = vec![0; fetch_len];
     dedup.fetch(fetch_off, &mut buf).unwrap();
 
-    let fetch_count = backend.state.lock().unwrap().fetch_calls;
-    assert!(
-        fetch_count >= 1,
-        "Expected at least 1 fetch for chunk 1, got {}",
-        fetch_count
+    let fetch_count = backend.state.lock().unwrap().foreground_fetch_calls;
+    assert_eq!(
+        fetch_count, 1,
+        "Only chunk 1 should fall back to the backend"
     );
 
     let mut original_data = vec![0; fetch_len];
@@ -545,14 +549,14 @@ fn test_fetch_partial_deduped_block() {
     dedup
         .dedup(off as u64, len as u32, None, CheckSumMethod::Blake3)
         .unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 1);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 1);
 
     let fetch_off = CHUNK_SIZE / 4;
     let fetch_len = CHUNK_SIZE / 2;
     let mut buf = vec![0; fetch_len];
     dedup.fetch(fetch_off, &mut buf).unwrap();
 
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 1);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 1);
 
     let mut original_data = vec![0; fetch_len];
     backend.fetch(fetch_off, &mut original_data).unwrap();
@@ -573,17 +577,17 @@ fn test_dedup_with_precomputed_checksum() {
     dedup
         .dedup(off1 as u64, len, None, CheckSumMethod::Sha256)
         .unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 2);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 2);
 
     dedup
         .dedup(off2 as u64, len, Some(cs), CheckSumMethod::Sha256)
         .unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 2);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 2);
 
     let mut buf = vec![0; len as usize];
     dedup.fetch(off2 as usize, &mut buf).unwrap();
     assert_eq!(buf, data);
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 2);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 2);
 }
 
 #[test]
@@ -618,11 +622,11 @@ fn test_dedup_instances_isolate_by_data_id() {
     dedup_a
         .dedup(off as u64, len, None, CheckSumMethod::Blake3)
         .unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 1);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 1);
 
     let mut buf = vec![0_u8; len as usize];
     dedup_b.fetch(off as usize, &mut buf).unwrap();
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 2);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 2);
 }
 
 #[test]
@@ -632,15 +636,17 @@ fn test_fetch_fallback_on_missing_global_data() {
     let len = CHUNK_SIZE;
 
     let data_cs = CheckSum::from_data(b"some fake data", CheckSumMethod::Blake3);
-    let range = DedupRange::new(off as u64, len as u32);
+    let range = DedupRange::new_with_id(dedup.core.id, off as u64, len as u32);
     dedup.core.add_local_dedup_info(&range, &data_cs).unwrap();
+    assert!(dedup.core.dedup_check_range(&range).unwrap());
+    assert!(!dedup.core.chunk_db.has_chunk(&data_cs).unwrap());
 
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 0);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 0);
 
     let mut buf = vec![0; len as usize];
     dedup.fetch(off as usize, &mut buf).unwrap();
 
-    assert_eq!(backend.state.lock().unwrap().fetch_calls, 1);
+    assert_eq!(backend.state.lock().unwrap().foreground_fetch_calls, 1);
 
     let mut original_data = vec![0; len as usize];
     backend.fetch(off as usize, &mut original_data).unwrap();
