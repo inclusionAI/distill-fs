@@ -1,4 +1,4 @@
-name: Static binary
+name: CI
 
 on:
   pull_request:
@@ -11,11 +11,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: static-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
+    name: Build and test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -24,7 +25,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Validate release tag
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -37,7 +38,7 @@ jobs:
           assert tag == f"v{version}", "tag must match Cargo.toml"
           PY
           git merge-base --is-ancestor HEAD origin/main
-      - name: Test musl build
+      - name: Check formatting, build, and test musl binary
         run: docker build --platform linux/amd64 --target test -f ci/release.Dockerfile -t distill-fs-static-test .
       - name: Test raw and Nydus FUSE mounts
         run: |
@@ -70,7 +71,7 @@ jobs:
           retention-days: 14
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
