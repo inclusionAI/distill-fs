@@ -75,3 +75,8 @@
 
 - Open both chunk and index environments with `read_txn_without_tls()` and retain the `Env<WithoutTls>` types. Reader slots must be released with transactions: musl thread-exit TLS destructors can race with environment teardown and access an unmapped LMDB reader table.
 - Keep concurrent reader shutdown coverage for both databases when changing their lifecycle.
+
+## ChunkDB Capacity Contract
+
+- Pass `--chunk-db-size` consistently to mount, serve-chunk, gc-chunk, and stats-chunk. The caller owns configuration consistency across all processes sharing a directory.
+- Omitted capacity retains the platform default. Existing-cache resizing is unsupported; do not add automatic resize, persisted-capacity discovery, or initialization coordination.

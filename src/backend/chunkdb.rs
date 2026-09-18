@@ -37,6 +37,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+mod capacity;
+pub use capacity::parse_chunk_db_size;
+
 pub const CHUNK_DB_NAME: &str = "data";
 const ACCESS_DB_NAME: &str = "chunk_access";
 const ACCESS_INDEX_DB_NAME: &str = "chunk_access_index";
@@ -779,14 +782,25 @@ impl ChunkDB {
         path: P,
         index_ctl: Option<Arc<dyn ChunkIndexControl>>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_size_and_index_ctl(path, None, index_ctl)
+    }
+
+    /// Open a shared cache with a configured map size. Every process using the
+    /// directory must use the same size; resizing existing caches is unsupported.
+    pub fn new_with_size_and_index_ctl<P: AsRef<Path>>(
+        path: P,
+        size: Option<usize>,
+        index_ctl: Option<Arc<dyn ChunkIndexControl>>,
+    ) -> anyhow::Result<Self> {
+        let size = size.unwrap_or(CHUNK_DB_SIZE);
+        capacity::validate_size(size)?;
         let meter = global::meter("distill_fs.chunkdb");
         let open_begin = Instant::now();
         let env = unsafe {
-            // Release reader slots with their transactions. A TLS destructor
-            // can race environment teardown when worker threads exit on musl.
+            // Release reader slots with their transactions, including on musl.
             EnvOpenOptions::new()
                 .read_txn_without_tls()
-                .map_size(CHUNK_DB_SIZE)
+                .map_size(size)
                 .max_readers(LMDB_MAX_READERS)
                 .max_dbs(MAX_DBS)
                 .open(path)?
@@ -794,6 +808,7 @@ impl ChunkDB {
         let stale_readers = env.clear_stale_readers()?;
         let actual_max_readers = env.max_readers();
         info!(
+            map_size_bytes = env.info().map_size,
             max_readers = actual_max_readers,
             stale_readers_cleared = stale_readers,
             elapsed = ?open_begin.elapsed(),
@@ -1260,10 +1275,12 @@ pub struct GcWorker {
 impl GcWorker {
     pub fn new_with_local_client<P: AsRef<Path>>(
         chunk_db_dir: P,
+        size: Option<usize>,
         local_chunk_client: Option<Arc<dyn ChunkIndexControl>>,
     ) -> anyhow::Result<Self> {
         Self::new_with_opts_and_client(
             chunk_db_dir,
+            size,
             Duration::from_secs(DEFAULT_GC_EXPIRE_SECS),
             GC_HIGH_WATERMARK,
             GC_LOW_WATERMARK,
@@ -1273,6 +1290,7 @@ impl GcWorker {
 
     pub fn new_with_opts_and_client<P: AsRef<Path>>(
         chunk_db_dir: P,
+        size: Option<usize>,
         expire_after: Duration,
         high_watermark: f64,
         low_watermark: f64,
@@ -1284,7 +1302,7 @@ impl GcWorker {
         {
             return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid GC watermark").into());
         }
-        let chunk_db = ChunkDB::new(chunk_db_dir)?;
+        let chunk_db = ChunkDB::new_with_size_and_index_ctl(chunk_db_dir, size, None)?;
         Ok(Self {
             chunk_db,
             local_chunk_client,

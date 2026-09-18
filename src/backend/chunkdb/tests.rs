@@ -446,6 +446,7 @@ fn test_gc_worker_unregisters_deleted_checksums() {
     let local_client = LocalChunkClient::new(runtime, &sock, Duration::from_millis(300));
     let worker = GcWorker::new_with_opts_and_client(
         temp.path(),
+        None,
         Duration::from_secs(10),
         1.0,
         1.0,
@@ -726,4 +727,39 @@ fn test_concurrent_reader_shutdown() {
             assert!(!db.has_chunk(&CheckSum::empty()).unwrap());
         });
     }
+}
+
+#[test]
+fn small_capacity_gc_and_map_full_preserve_data_and_capacity() {
+    let temp = TempDir::new().unwrap();
+    let db = ChunkDB::new_with_size_and_index_ctl(temp.path(), Some(8 << 20), None).unwrap();
+    for n in 0..16_u8 {
+        let data = vec![n; 64 * 1024];
+        let cs = CheckSum::from_data(&data, CheckSumMethod::Blake3);
+        db.add_chunk(&cs, data.clone()).unwrap();
+        assert_eq!(db.get_chunk(&cs).unwrap(), Some(data));
+    }
+    // Wait for asynchronous access indexing before asking LRU to remove entries.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let txn = db.env.read_txn().unwrap();
+        let count = db.access_index.len(&txn).unwrap();
+        drop(txn);
+        if count == 16 {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(db.gc_lru(16).unwrap().removed, 16);
+    // A chunk larger than the map cannot be cached and must not trigger growth.
+    let oversized = vec![42; 9 << 20];
+    let cs = CheckSum::from_data(&oversized, CheckSumMethod::Blake3);
+    let err = db.add_chunk(&cs, oversized).unwrap_err();
+    assert!(err.to_string().contains("MDB_MAP_FULL"));
+    let data = b"readable after full".to_vec();
+    let cs = CheckSum::from_data(&data, CheckSumMethod::Blake3);
+    db.add_chunk(&cs, data.clone()).unwrap();
+    assert_eq!(db.get_chunk(&cs).unwrap(), Some(data));
+    assert_eq!(db.env.info().map_size, 8 << 20);
 }

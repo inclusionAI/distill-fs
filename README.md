@@ -444,3 +444,9 @@ cargo run --bin peer_bench -- --help
 ## License
 
 Apache-2.0
+
+## ChunkDB capacity
+
+`mount`, `serve-chunk`, `gc-chunk`, and `stats-chunk` accept `--chunk-db-size`, for example `--chunk-db-size 64GiB`. This sets the shared LMDB map capacity, including chunk and access-index pages; it is not a RAM reservation or a quota for all image caches. Use whole bytes or an integer followed by `B`, `KiB`, `MiB`, `GiB`, or `TiB`. Values must be at least 1 MiB, fit the addressable range, and align to the host page size.
+
+Omitting the option preserves the default: 100 GiB for Linux production builds, 512 MiB for unit-test/non-Linux builds. Every process sharing a `--chunk-db-dir`, including statistics and GC, must receive the same capacity. The caller (such as sandboxd) owns this consistency; distill-fs does not coordinate or enforce capacity agreement. Resizing an existing database is unsupported. To change capacity, stop all users and select a new cache directory.

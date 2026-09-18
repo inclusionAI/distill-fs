@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::backend::cache::Cache;
-use crate::backend::chunkdb::{ChunkDB, ChunkIndexControl, GcWorker};
+use crate::backend::chunkdb::{parse_chunk_db_size, ChunkDB, ChunkIndexControl, GcWorker};
 use crate::backend::general::GeneralBackend;
 use crate::backend::indexdb::IndexDB;
 use crate::backend::peer::{
@@ -95,6 +95,10 @@ struct FsOptions {
     fuse_worker_num: u32,
     #[arg(long, default_value = "")]
     chunk_db_dir: String,
+    /// ChunkDB map capacity (e.g. 100GiB). All users of the directory must agree;
+    /// changing the capacity of an existing database is unsupported.
+    #[arg(long, value_parser = parse_chunk_db_size)]
+    chunk_db_size: Option<usize>,
     #[arg(long, default_value = "")]
     image_meta_dir: String,
     /// for nydus: bootstrap file path
@@ -120,6 +124,10 @@ struct ServeChunkOptions {
     log_file: String,
     #[arg(long)]
     chunk_db_dir: String,
+    /// ChunkDB map capacity (e.g. 100GiB). All users of the directory must agree;
+    /// changing the capacity of an existing database is unsupported.
+    #[arg(long, value_parser = parse_chunk_db_size)]
+    chunk_db_size: Option<usize>,
     #[arg(long, default_value_t = 9876)]
     listen_port: u16,
     #[arg(long, default_value = "")]
@@ -146,6 +154,10 @@ struct ServeChunkOptions {
 struct GcOptions {
     #[arg(long)]
     chunk_db_dir: String,
+    /// ChunkDB map capacity (e.g. 100GiB). All users of the directory must agree;
+    /// changing the capacity of an existing database is unsupported.
+    #[arg(long, value_parser = parse_chunk_db_size)]
+    chunk_db_size: Option<usize>,
     #[arg(long, default_value = "")]
     chunk_server_sock: String,
     #[arg(long, default_value_t = false)]
@@ -156,6 +168,10 @@ struct GcOptions {
 struct StatsOptions {
     #[arg(long)]
     chunk_db_dir: String,
+    /// ChunkDB map capacity (e.g. 100GiB). All users of the directory must agree;
+    /// changing the capacity of an existing database is unsupported.
+    #[arg(long, value_parser = parse_chunk_db_size)]
+    chunk_db_size: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -345,11 +361,15 @@ struct Cli {
 
 fn setup_chunk_and_index_db(
     chunk_db_dir: &str,
+    chunk_db_size: Option<usize>,
     image_meta_dir: &str,
     index_ctl: Option<Arc<dyn ChunkIndexControl>>,
 ) -> anyhow::Result<Option<(Arc<ChunkDB>, Arc<IndexDB>)>> {
     let conf_chunk_db = !chunk_db_dir.is_empty();
     let conf_image_meta = !image_meta_dir.is_empty();
+    if chunk_db_size.is_some() && !conf_chunk_db {
+        anyhow::bail!("--chunk-db-size requires --chunk-db-dir");
+    }
     if conf_image_meta != conf_chunk_db {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -358,7 +378,11 @@ fn setup_chunk_and_index_db(
         .into());
     }
     if conf_chunk_db {
-        let chunk_db = Arc::new(ChunkDB::new_with_index_ctl(chunk_db_dir, index_ctl)?);
+        let chunk_db = Arc::new(ChunkDB::new_with_size_and_index_ctl(
+            chunk_db_dir,
+            chunk_db_size,
+            index_ctl,
+        )?);
         let index_db = Arc::new(IndexDB::open(image_meta_dir)?);
         Ok(Some((chunk_db, index_db)))
     } else {
@@ -378,6 +402,7 @@ fn prepare_oss(opts: &FsOptions) -> anyhow::Result<RawImage> {
     let local_chunk_client = build_local_chunk_client(opts);
     let dedup_db = setup_chunk_and_index_db(
         &opts.chunk_db_dir,
+        opts.chunk_db_size,
         &opts.image_meta_dir,
         local_chunk_client
             .as_ref()
@@ -401,6 +426,7 @@ fn prepare_local(opts: &FsOptions) -> anyhow::Result<RawImage> {
     let local_chunk_client = build_local_chunk_client(opts);
     let dedup_db = setup_chunk_and_index_db(
         &opts.chunk_db_dir,
+        opts.chunk_db_size,
         &opts.image_meta_dir,
         local_chunk_client
             .as_ref()
@@ -462,6 +488,7 @@ pub fn run() -> anyhow::Result<()> {
                     let t = std::time::Instant::now();
                     let dedup_db = setup_chunk_and_index_db(
                         &fs_opts.chunk_db_dir,
+                        fs_opts.chunk_db_size,
                         &fs_opts.image_meta_dir,
                         local_chunk_client
                             .as_ref()
@@ -542,7 +569,11 @@ pub fn run() -> anyhow::Result<()> {
                     chunk_index.clone(),
                 )) as Arc<dyn ChunkIndexControl>
             });
-            let chunk_db = Arc::new(ChunkDB::new_with_index_ctl(&opts.chunk_db_dir, index_ctl)?);
+            let chunk_db = Arc::new(ChunkDB::new_with_size_and_index_ctl(
+                &opts.chunk_db_dir,
+                opts.chunk_db_size,
+                index_ctl,
+            )?);
             let peer_client =
                 if discovery.get_peers().is_empty() && opts.peer_discovery.trim().is_empty() {
                     None
@@ -567,6 +598,7 @@ pub fn run() -> anyhow::Result<()> {
 
             let worker = GcWorker::new_with_local_client(
                 &gc_opts.chunk_db_dir,
+                gc_opts.chunk_db_size,
                 build_gc_local_chunk_client(&gc_opts.chunk_db_dir, &gc_opts.chunk_server_sock),
             )?;
             worker.run(gc_opts.dry_run)
@@ -578,7 +610,11 @@ pub fn run() -> anyhow::Result<()> {
                 .with_writer(std::io::stderr)
                 .init();
 
-            let chunk_db = ChunkDB::new(&stats_opts.chunk_db_dir)?;
+            let chunk_db = ChunkDB::new_with_size_and_index_ctl(
+                &stats_opts.chunk_db_dir,
+                stats_opts.chunk_db_size,
+                None,
+            )?;
             let stats = chunk_db.get_stats()?;
             println!("{}", serde_json::to_string_pretty(&stats)?);
             Ok(())

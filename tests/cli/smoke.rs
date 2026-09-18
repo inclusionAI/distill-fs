@@ -58,6 +58,8 @@ fn serve_chunk_starts_without_external_services() {
             "serve-chunk",
             "--chunk-db-dir",
             temp.path().to_str().unwrap(),
+            "--chunk-db-size",
+            "8MiB",
             "--listen-port",
             "0",
             "--chunk-server-sock",
@@ -90,8 +92,33 @@ fn serve_chunk_starts_without_external_services() {
         socket.exists(),
         "serve-chunk did not create its Unix socket"
     );
+    // Independent maintenance processes must see the serving process's capacity.
+    let stats = Command::new(env!("CARGO_BIN_EXE_distill_fs"))
+        .args([
+            "stats-chunk",
+            "--chunk-db-dir",
+            temp.path().to_str().unwrap(),
+            "--chunk-db-size",
+            "8MiB",
+        ])
+        .output()
+        .unwrap();
+    let gc = Command::new(env!("CARGO_BIN_EXE_distill_fs"))
+        .args([
+            "gc-chunk",
+            "--chunk-db-dir",
+            temp.path().to_str().unwrap(),
+            "--chunk-db-size",
+            "8MiB",
+        ])
+        .output()
+        .unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
+    assert!(stats.status.success(), "{:?}", stats);
+    assert!(gc.status.success(), "{:?}", gc);
+    let value: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(value["storage"]["total_size_bytes"], 8 << 20);
 }
 
 #[test]
@@ -163,4 +190,16 @@ fn cli_stats_chunk_outputs_json_to_stdout() {
         serde_json::from_str(&stdout).expect("stdout should be valid JSON");
     assert!(parsed["storage"]["total_size_bytes"].as_u64().is_some());
     assert!(parsed["readers"]["max"].as_u64().is_some());
+}
+
+#[test]
+fn all_chunk_commands_expose_capacity() {
+    for command in ["mount", "serve-chunk", "gc-chunk", "stats-chunk"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_distill_fs"))
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("--chunk-db-size"));
+    }
 }
