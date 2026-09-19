@@ -1,6 +1,7 @@
 # Build on musl so the C dependencies and Rust use the same libc.
 FROM rust:1.85.0-alpine3.21@sha256:bea885d2711087e67a9f7a7cd1a164976f4c35389478512af170730014d2452a AS build
-RUN apk add --no-cache build-base cmake git perl pkgconf python3 binutils
+RUN apk add --no-cache build-base cmake git perl pkgconf python3 binutils && \
+    rustup component add rustfmt
 WORKDIR /work
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static" \
@@ -10,12 +11,16 @@ COPY .cargo/ .cargo/
 COPY src/ src/
 COPY tests/ tests/
 RUN mkdir -p "$TMPDIR" && \
+    cargo fmt --all -- --check && \
     cargo build --locked --release --target x86_64-unknown-linux-musl --bin distill_fs
+# Verify the final stripped binary before tests and packaging.
 # Reject both dynamically linked executables and static PIEs with shared deps.
 RUN binary=target/x86_64-unknown-linux-musl/release/distill_fs; \
     readelf -h "$binary" && \
     ! readelf -l "$binary" | grep -q INTERP && \
-    ! readelf -d "$binary" | grep -q NEEDED
+    ! readelf -d "$binary" | grep -q NEEDED && \
+    readelf --wide --sections "$binary" > /work/release-sections.txt && \
+    ! grep -Eq '[[:space:]]\.(symtab|debug_[^[:space:]]*)[[:space:]]' /work/release-sections.txt
 
 FROM build AS test
 RUN cargo test --locked --release --target x86_64-unknown-linux-musl

@@ -444,3 +444,15 @@ cargo run --bin peer_bench -- --help
 ## License
 
 Apache-2.0
+
+## ChunkDB capacity
+
+`mount`, `serve-chunk`, `gc-chunk`, and `stats-chunk` accept `--chunk-db-size`, for example `--chunk-db-size 64GiB`. This sets the shared LMDB map capacity, including chunk and access-index pages; it is not a RAM reservation or a quota for all image caches. Use whole bytes or an integer followed by `B`, `KiB`, `MiB`, `GiB`, or `TiB`. Values must be at least 1 MiB, fit the addressable range, and align to the host page size.
+
+Omitting the option preserves the default: 100 GiB for Linux production builds, 512 MiB for unit-test/non-Linux builds. Every process sharing a `--chunk-db-dir`, including statistics and GC, must receive the same capacity. The caller (such as sandboxd) owns this consistency; distill-fs does not coordinate or enforce capacity agreement. Resizing an existing database is unsupported. To change capacity, stop all users and select a new cache directory.
+
+## GitHub CI and releases
+
+Pull requests, pushes to `main`, version-tag pushes, and manual workflow runs execute the CI workflow. The `build` job uses the pinned Rust musl container pipeline for formatting checks, an optimized Linux/amd64 static build, unit/integration tests, and privileged raw/Nydus FUSE tests. The release profile strips symbols at build time, so tests exercise the stripped executable that is packaged. ELF checks reject dynamic dependencies, symbol tables, and debug sections; empty-root smoke tests verify the executable works without a host runtime. The job uploads the verified archive and checksums.
+
+Only a push of a version tag triggers the `release` job, after the build and tests pass. Tags must use `vX.Y.Z` or `vX.Y.Z-rc.N`, match `Cargo.toml`, and reference a commit on `main`. Release candidates are published as prereleases. The release job downloads and verifies the exact tested archive; it does not rebuild the executable or overwrite existing release assets. PRs, branch pushes, and manual runs (including manual runs selecting a tag) never publish a GitHub Release.

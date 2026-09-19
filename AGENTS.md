@@ -66,6 +66,8 @@
 
 ## Static Release Contract
 
+- `.github/workflows/release.yml` uses one build job and the pinned musl container pipeline for formatting, static compilation, unit/integration tests, and privileged FUSE checks. Keep release publication gated on a version-tag **push** and a successful build job; manual workflow runs must never publish, even when selecting a tag.
+- Strip release symbols at compilation using `[profile.release]`. Verify the stripped ELF before tests and package that same executable; do not strip or rebuild a different binary in the release job.
 - `ci/release.Dockerfile` builds Linux/amd64 musl artifacts with the pinned Rust image and `Cargo.lock`. Keep static ELF checks and empty-root smoke tests mandatory for packaging.
 - `ci/package-release.py` defines archive names and provenance. Keep these synchronized with AKernel's `builder/scripts/install-distill-fs.sh` and `builder/distill-fs-versions.env`.
 - Version tags must match `Cargo.toml` and point to commits on `main`. The workflow publishes already-tested bytes and must not overwrite release assets.
@@ -75,3 +77,8 @@
 
 - Open both chunk and index environments with `read_txn_without_tls()` and retain the `Env<WithoutTls>` types. Reader slots must be released with transactions: musl thread-exit TLS destructors can race with environment teardown and access an unmapped LMDB reader table.
 - Keep concurrent reader shutdown coverage for both databases when changing their lifecycle.
+
+## ChunkDB Capacity Contract
+
+- Pass `--chunk-db-size` consistently to mount, serve-chunk, gc-chunk, and stats-chunk. The caller owns configuration consistency across all processes sharing a directory.
+- Omitted capacity retains the platform default. Existing-cache resizing is unsupported; do not add automatic resize, persisted-capacity discovery, or initialization coordination.
