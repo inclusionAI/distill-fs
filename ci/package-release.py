@@ -13,18 +13,26 @@ import tomllib
 root = Path(__file__).resolve().parent.parent
 version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
 revision = sys.argv[1]
+arch = sys.argv[2]
+targets = {
+    "amd64": "x86_64-unknown-linux-musl",
+    "arm64": "aarch64-unknown-linux-musl",
+}
+if arch not in targets:
+    raise SystemExit(f"unsupported release architecture: {arch}")
+target = targets[arch]
 if not re.fullmatch(r"[0-9a-f]{40}", revision):
     raise SystemExit("SOURCE_REVISION must be the full source commit")
 if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?", version):
     raise SystemExit("release version must be X.Y.Z or X.Y.Z-rc.N")
-binary = root / "target/x86_64-unknown-linux-musl/release/distill_fs"
+binary = root / "target" / target / "release/distill_fs"
 manifest = {
     "component": "distill-fs",
     "version": version,
     "release_tag": f"v{version}",
     "source_revision": revision,
     "repository": "inclusionAI/distill-fs",
-    "target": "x86_64-unknown-linux-musl",
+    "target": target,
     "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
 }
 files = {
@@ -36,7 +44,7 @@ files = {
 }
 output = root / "dist"
 output.mkdir(exist_ok=True)
-archive = output / f"distill-fs-v{version}-linux-amd64.tar.gz"
+archive = output / f"distill-fs-v{version}-linux-{arch}.tar.gz"
 # Stable metadata lets a single build be compared and promoted byte for byte.
 with archive.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as zipped:
     with tarfile.open(fileobj=zipped, mode="w") as tar:

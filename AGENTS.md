@@ -66,9 +66,9 @@
 
 ## Static Release Contract
 
-- `.github/workflows/release.yml` uses one build job and the pinned musl container pipeline for formatting, static compilation, unit/integration tests, and privileged FUSE checks. Keep release publication gated on a version-tag **push** and a successful build job; manual workflow runs must never publish, even when selecting a tag.
+- `.github/workflows/release.yml` uses native amd64 and arm64 build jobs with the pinned musl container pipeline for formatting, static compilation, unit/integration tests, and privileged FUSE checks. Keep release publication gated on a version-tag **push** and both successful build jobs; manual workflow runs must never publish, even when selecting a tag.
 - Strip release symbols at compilation using `[profile.release]`. Verify the stripped ELF before tests and package that same executable; do not strip or rebuild a different binary in the release job.
-- `ci/release.Dockerfile` builds Linux/amd64 musl artifacts with the pinned Rust image and `Cargo.lock`. Keep static ELF checks and empty-root smoke tests mandatory for packaging.
+- `ci/release.Dockerfile` builds native Linux/amd64 and Linux/arm64 musl artifacts with the pinned Rust image and `Cargo.lock`. Keep static ELF checks and empty-root smoke tests mandatory for both architectures.
 - `ci/package-release.py` defines archive names and provenance. Keep these synchronized with AKernel's `builder/scripts/install-distill-fs.sh` and `builder/distill-fs-versions.env`.
 - Version tags must match `Cargo.toml` and point to commits on `main`. The workflow publishes already-tested bytes and must not overwrite release assets.
 - Publish a release before updating consumer checksum pins. Do not use guessed digests or present locally rebuilt artifacts as published binaries.
