@@ -84,15 +84,15 @@ cargo run --bin distill_fs -- --help
 
 ## Static releases
 
-GitHub releases provide `distill-fs-vX.Y.Z-linux-amd64.tar.gz` and `SHA256SUMS`. The archive contains the `distill_fs` executable, `manifest.json`, `LICENSE`, `NOTICE`, and the exact `Cargo.lock`. The executable uses musl and has no dynamic loader or shared-library dependencies. Mounting still requires Linux FUSE support and suitable privileges; remote HTTPS backends still need a CA certificate store on the host.
+GitHub releases provide `distill-fs-vX.Y.Z-linux-amd64.tar.gz`, `distill-fs-vX.Y.Z-linux-arm64.tar.gz`, and one `SHA256SUMS` covering both archives. Each archive contains the `distill_fs` executable, `manifest.json`, `LICENSE`, `NOTICE`, and the exact `Cargo.lock`. The executable uses musl and has no dynamic loader or shared-library dependencies. Mounting still requires Linux FUSE support and suitable privileges; remote HTTPS backends still need a CA certificate store on the host.
 
-The first release is pending publication. Once published, download from `https://github.com/inclusionAI/distill-fs/releases/download/vX.Y.Z/`, verify the archive against a reviewed SHA-256 pin, extract it, and install `distill_fs` on `PATH`. Keep the license and provenance files with the binary. Production consumers must pin the release URL and checksum in source control; fetching a checksum alongside an unpinned binary is not an independent integrity check.
+Download a published release from `https://github.com/inclusionAI/distill-fs/releases/download/vX.Y.Z/`, verify the archive against a reviewed SHA-256 pin, extract it, and install `distill_fs` on `PATH`. Keep the license and provenance files with the binary. Production consumers must pin the release URL and checksum in source control; fetching a checksum alongside an unpinned binary is not an independent integrity check.
 
-Build and test the same Linux/amd64 artifact locally with Docker:
+Build and test an artifact locally with Docker, selecting `amd64` or `arm64` to match the target host:
 
 ```bash
-docker build --platform linux/amd64 --target test -f ci/release.Dockerfile .
-docker build --platform linux/amd64 -f ci/release.Dockerfile \
+docker build --platform linux/arm64 --target test -f ci/release.Dockerfile .
+docker build --platform linux/arm64 -f ci/release.Dockerfile \
   --build-arg "SOURCE_REVISION=$(git rev-parse HEAD)" \
   --output type=local,dest=dist .
 (cd dist && sha256sum -c SHA256SUMS)
