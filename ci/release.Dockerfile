@@ -24,9 +24,13 @@ RUN set -eu; \
     cargo build --locked --release --target "$target" --bin distill_fs
 # Verify the final stripped binary before tests and packaging.
 # Reject both dynamically linked executables and static PIEs with shared deps.
-RUN case "$TARGETARCH" in amd64) target=x86_64-unknown-linux-musl ;; arm64) target=aarch64-unknown-linux-musl ;; esac; \
+RUN case "$TARGETARCH" in \
+      amd64) target=x86_64-unknown-linux-musl; machine='Advanced Micro Devices X86-64' ;; \
+      arm64) target=aarch64-unknown-linux-musl; machine=AArch64 ;; \
+    esac; \
     binary="target/$target/release/distill_fs"; \
     readelf -h "$binary" && \
+    readelf -h "$binary" | grep -Eq "Machine:[[:space:]]+$machine$" && \
     ! readelf -l "$binary" | grep -q INTERP && \
     ! readelf -d "$binary" | grep -q NEEDED && \
     readelf --wide --sections "$binary" > /work/release-sections.txt && \

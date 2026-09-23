@@ -46,8 +46,10 @@ jobs:
           with open("Cargo.toml", "rb") as source:
               version = tomllib.load(source)["package"]["version"]
           tag = os.environ["RELEASE_TAG"]
-          assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?", tag), tag
-          assert tag == f"v{version}", "tag must match Cargo.toml"
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?", tag):
+              raise SystemExit(f"invalid release tag: {tag}")
+          if tag != f"v{version}":
+              raise SystemExit("tag must match Cargo.toml")
           PY
           git merge-base --is-ancestor HEAD origin/main
       - name: Check formatting, build, and test musl binary
@@ -105,9 +107,45 @@ jobs:
           test -f distill-fs-linux-arm64/SHA256SUMS
           for arch in amd64 arm64; do
             (cd "distill-fs-linux-${arch}" && sha256sum -c SHA256SUMS)
+            case "$arch" in
+              amd64) target=x86_64-unknown-linux-musl ;;
+              arm64) target=aarch64-unknown-linux-musl ;;
+            esac
+            python3 - "distill-fs-linux-${arch}" "$RELEASE_TAG" "$GITHUB_SHA" "$arch" "$target" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          directory, tag, revision, arch, target = sys.argv[1:]
+          directory = Path(directory)
+          archive = directory / f"distill-fs-{tag}-linux-{arch}.tar.gz"
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          if (directory / "SHA256SUMS").read_text() != f"{digest}  {archive.name}\n":
+              raise SystemExit(f"unexpected checksum file for {arch}")
+          with tarfile.open(archive, "r:gz") as bundle:
+              if bundle.getnames() != ["distill_fs", "manifest.json", "LICENSE", "NOTICE", "Cargo.lock"]:
+                  raise SystemExit(f"unexpected archive contents for {arch}")
+              manifest = json.load(bundle.extractfile("manifest.json"))
+              binary_digest = hashlib.sha256(bundle.extractfile("distill_fs").read()).hexdigest()
+          expected_manifest = {
+              "component": "distill-fs",
+              "version": tag.removeprefix("v"),
+              "release_tag": tag,
+              "source_revision": revision,
+              "repository": "inclusionAI/distill-fs",
+              "target": target,
+              "binary_sha256": binary_digest,
+          }
+          if manifest != expected_manifest:
+              raise SystemExit(f"unexpected release manifest for {arch}")
+          PY
           done
           cat distill-fs-linux-{amd64,arm64}/SHA256SUMS > SHA256SUMS
-          mv distill-fs-linux-{amd64,arm64}/*.tar.gz .
+          for arch in amd64 arm64; do
+            mv "distill-fs-linux-${arch}/distill-fs-${RELEASE_TAG}-linux-${arch}.tar.gz" .
+          done
           sha256sum -c SHA256SUMS
           prerelease=()
           if [[ "$RELEASE_TAG" == *-rc.* ]]; then prerelease=(--prerelease); fi
