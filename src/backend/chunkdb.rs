@@ -464,6 +464,8 @@ struct WriteQueue {
 struct WriterChannel {
     inner: Mutex<WriteQueue>,
     cond: Condvar,
+    #[cfg(test)]
+    before_batch_write_txn: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl Default for WriterChannel {
@@ -471,6 +473,8 @@ impl Default for WriterChannel {
         Self {
             inner: Mutex::new(WriteQueue::default()),
             cond: Condvar::new(),
+            #[cfg(test)]
+            before_batch_write_txn: Mutex::new(None),
         }
     }
 }
@@ -692,6 +696,10 @@ impl WriterThread {
         };
         loop {
             check_deadline()?;
+            #[cfg(test)]
+            if let Some(ready) = self.channel.before_batch_write_txn.lock().unwrap().take() {
+                let _ = ready.send(());
+            }
             let mut wtxn = slow_write_txn(&self.env, "WriterThread::add_chunks")?;
             check_deadline()?;
             let result = batch.iter().try_for_each(|(cs, data)| {

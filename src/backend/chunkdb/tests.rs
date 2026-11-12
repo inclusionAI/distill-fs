@@ -64,6 +64,56 @@ fn expired_cache_backfill_releases_its_reservation() {
     assert!(budget.try_reserve(bytes).is_some());
 }
 
+#[test]
+fn cache_backfill_expires_while_waiting_for_writer_lock() {
+    use crate::backend::cache_write_budget::CacheWriteBudget;
+
+    let dir = TempDir::new().unwrap();
+    let db = ChunkDB::new(dir.path()).unwrap();
+    let data = vec![1; 1024];
+    let checksum = CheckSum::from_data(&data, CheckSumMethod::Blake3);
+    let bytes = data.capacity();
+    let budget = CacheWriteBudget::new(dir.path(), 1, bytes).unwrap();
+    let permit = budget.try_reserve(bytes).unwrap();
+
+    let held_txn = db.env.write_txn().unwrap();
+    let (ready, started) = mpsc::channel();
+    *db.writer_channel.before_batch_write_txn.lock().unwrap() = Some(ready);
+    let (reply, result) = mpsc::sync_channel(1);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    db.writer_channel.submit_high(WriteRequest::AddChunksBatch {
+        batch: ChunkBatch {
+            chunks: vec![(checksum, data)],
+            deadline: Some(deadline),
+            _permits: vec![permit],
+        },
+        reply,
+    });
+    started
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .expect("writer did not reach the lock attempt before expiry");
+
+    // The writer must remain blocked past the deadline with the permit charged.
+    let wait = deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50);
+    assert_eq!(
+        result.recv_timeout(wait).unwrap_err(),
+        mpsc::RecvTimeoutError::Timeout
+    );
+    assert!(budget.try_reserve(1).is_none());
+
+    drop(held_txn);
+    let err = result
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer did not finish after lock release")
+        .expect_err("expired backfill succeeded after lock release");
+    assert_eq!(
+        err.downcast_ref::<io::Error>().unwrap().kind(),
+        ErrorKind::TimedOut
+    );
+    assert!(!db.has_chunk(&checksum).unwrap());
+    assert!(budget.try_reserve(bytes).is_some());
+}
+
 #[derive(Debug, Default)]
 struct RecordingChunkIndex {
     registered: Arc<Mutex<Vec<CheckSum>>>,
