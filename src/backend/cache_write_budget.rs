@@ -214,7 +214,8 @@ mod tests {
         drop(permit);
         assert!(other.try_reserve(8).is_none());
         other.state.lock().unwrap().retry_after = Some(Instant::now());
-        assert!(other.try_reserve(8).is_some());
+        // A concurrent test's child can inherit the OFD until exec closes it.
+        let _permit = wait_for_slot(&other, 8);
     }
 
     struct ChildGuard(Child);
