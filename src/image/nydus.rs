@@ -15,6 +15,8 @@
 #[cfg(target_os = "linux")]
 use crate::backend::cache::Cache;
 #[cfg(target_os = "linux")]
+use crate::backend::cache_write_budget::{CacheWriteBudget, CacheWritePermit};
+#[cfg(target_os = "linux")]
 use crate::backend::chunkdb::CheckSumMethod;
 use crate::backend::chunkdb::{CheckSum, ChunkDB};
 #[cfg(target_os = "linux")]
@@ -28,6 +30,7 @@ use crate::image::FsReadMetrics;
 use crate::rate_limited_log;
 #[cfg(target_os = "linux")]
 use crate::utils::new_std_io_error;
+#[cfg(target_os = "linux")]
 use crate::utils::RateLimitedLog;
 #[cfg(target_os = "linux")]
 use fuse_backend_rs::abi::fuse_abi::statvfs64;
@@ -57,12 +60,13 @@ use std::io::{self, ErrorKind};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::Ordering;
 use std::sync::atomic::Ordering::Relaxed;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -72,21 +76,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "linux")]
 use tracing::error;
 use tracing::info;
+#[cfg(target_os = "linux")]
 use tracing::warn;
 
+#[cfg(target_os = "linux")]
 const CHUNK_STORE_REQ_BUF_SIZE: usize = 4096;
+#[cfg(target_os = "linux")]
 const CHUNK_STORE_BATCH_SIZE: usize = 64;
+#[cfg(target_os = "linux")]
+const CACHE_WRITE_SLOTS: usize = 64;
+#[cfg(target_os = "linux")]
+const CACHE_WRITE_SLOT_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const CACHE_WRITE_MAX_AGE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const MAP_FULL_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+#[cfg(target_os = "linux")]
 struct ChunkStoreRequest {
     checksum: CheckSum,
     data: Vec<u8>,
+    deadline: Instant,
+    permit: CacheWritePermit,
 }
 
+#[cfg(target_os = "linux")]
 struct ChunkStoreWorker {
     chunk_db: Arc<ChunkDB>,
     rx: Receiver<ChunkStoreRequest>,
 }
 
+#[cfg(target_os = "linux")]
 impl ChunkStoreWorker {
     fn new(chunk_db: Arc<ChunkDB>, rx: Receiver<ChunkStoreRequest>) -> Self {
         Self { chunk_db, rx }
@@ -94,40 +114,34 @@ impl ChunkStoreWorker {
 
     fn run(self) {
         let mut batch = Vec::with_capacity(CHUNK_STORE_BATCH_SIZE);
-        let mut batch_data: Vec<Vec<u8>> = Vec::with_capacity(CHUNK_STORE_BATCH_SIZE);
+        let warn_limiter = RateLimitedLog::new(5);
+        let mut retry_after = None;
 
         while let Ok(req) = self.rx.recv() {
-            batch.push(req.checksum);
-            batch_data.push(req.data);
-
-            // Try to collect more requests without blocking
-            while batch.len() < CHUNK_STORE_BATCH_SIZE {
-                match self.rx.try_recv() {
-                    Ok(req) => {
-                        batch.push(req.checksum);
-                        batch_data.push(req.data);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
+            if retry_after.is_some_and(|deadline| Instant::now() < deadline) {
+                continue;
+            }
+            batch.push(req);
+            batch.extend(self.rx.try_iter().take(CHUNK_STORE_BATCH_SIZE - 1));
+            let now = Instant::now();
+            batch.retain(|req| req.deadline > now);
+            let Some(deadline) = batch.iter().map(|req| req.deadline).min() else {
+                continue;
+            };
+            let (chunks, permits) = batch
+                .drain(..)
+                .map(|req| ((req.checksum, req.data), req.permit))
+                .unzip();
+            if let Err(e) = self.chunk_db.add_cache_chunks(chunks, permits, deadline) {
+                if matches!(
+                    e.downcast_ref::<heed::Error>(),
+                    Some(heed::Error::Mdb(heed::MdbError::MapFull))
+                ) {
+                    retry_after = Some(Instant::now() + MAP_FULL_RETRY_DELAY);
                 }
-            }
-
-            // Process the batch
-            let chunks: Vec<(CheckSum, Vec<u8>)> =
-                batch.drain(..).zip(batch_data.drain(..)).collect();
-
-            if let Err(e) = self.chunk_db.add_chunks(chunks) {
-                warn!(err = debug(e), "Failed to store chunk batch into chunkdb.");
-            }
-        }
-
-        // Process any remaining requests in the batch
-        if !batch.is_empty() {
-            let chunks: Vec<(CheckSum, Vec<u8>)> =
-                batch.drain(..).zip(batch_data.drain(..)).collect();
-
-            if let Err(e) = self.chunk_db.add_chunks(chunks) {
-                warn!(err = debug(e), "Failed to store chunk batch into chunkdb.");
+                rate_limited_log!(warn_limiter, {
+                    warn!(err = debug(e), "Failed to store chunk batch into chunkdb.");
+                });
             }
         }
     }
@@ -146,13 +160,15 @@ pub struct NydusImage {
     dedup_db: Option<(Arc<ChunkDB>, Arc<IndexDB>)>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     local_chunk_client: Option<Arc<LocalChunkClient>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
+    store_budget: Option<CacheWriteBudget>,
+    #[cfg(target_os = "linux")]
     store_tx: Option<SyncSender<ChunkStoreRequest>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     store_worker: Mutex<Option<thread::JoinHandle<()>>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     store_dropped_count: AtomicU64,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     store_warn_limiter: RateLimitedLog,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     cache_dir: String,
@@ -204,14 +220,31 @@ impl NydusImage {
         let i_uid = unsafe { libc::geteuid() } as u32;
         let i_gid = unsafe { libc::getegid() } as u32;
 
-        let (store_tx, store_worker) = if let Some((chunk_db, _)) = &dedup_db {
-            let (tx, rx) = mpsc::sync_channel(CHUNK_STORE_REQ_BUF_SIZE);
-            let worker = ChunkStoreWorker::new(chunk_db.clone(), rx);
-            let handle = thread::spawn(move || worker.run());
-            (Some(tx), Mutex::new(Some(handle)))
-        } else {
-            (None, Mutex::new(None))
-        };
+        #[cfg(target_os = "linux")]
+        let store_budget =
+            dedup_db.as_ref().and_then(|(chunk_db, _)| {
+                match CacheWriteBudget::new(
+                    chunk_db.path(),
+                    CACHE_WRITE_SLOTS,
+                    CACHE_WRITE_SLOT_BYTES,
+                ) {
+                    Ok(budget) => Some(budget),
+                    Err(e) => {
+                        warn!(err = debug(e), "Chunk backfill budget unavailable.");
+                        None
+                    }
+                }
+            });
+        #[cfg(target_os = "linux")]
+        let (store_tx, store_worker) =
+            if let (Some((chunk_db, _)), Some(_)) = (&dedup_db, &store_budget) {
+                let (tx, rx) = mpsc::sync_channel(CHUNK_STORE_REQ_BUF_SIZE);
+                let worker = ChunkStoreWorker::new(chunk_db.clone(), rx);
+                let handle = thread::spawn(move || worker.run());
+                (Some(tx), Mutex::new(Some(handle)))
+            } else {
+                (None, Mutex::new(None))
+            };
 
         Ok(Self {
             sb: Arc::new(sb),
@@ -220,9 +253,15 @@ impl NydusImage {
             backend,
             dedup_db,
             local_chunk_client,
+            #[cfg(target_os = "linux")]
+            store_budget,
+            #[cfg(target_os = "linux")]
             store_tx,
+            #[cfg(target_os = "linux")]
             store_worker,
+            #[cfg(target_os = "linux")]
             store_dropped_count: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
             store_warn_limiter: RateLimitedLog::new(5),
             cache_dir: cache_dir.to_string(),
             i_uid,
@@ -377,20 +416,33 @@ impl NydusImage {
 
     #[cfg(target_os = "linux")]
     fn store_chunk_bg(&self, cs: CheckSum, data: Vec<u8>) {
-        if let Some(tx) = &self.store_tx {
-            let req = ChunkStoreRequest { checksum: cs, data };
-            if let Err(_e) = tx.try_send(req) {
-                let dropped = self.store_dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
-                rate_limited_log!(self.store_warn_limiter, {
-                    warn!(
-                        dropped_count = dropped,
-                        queue_size = CHUNK_STORE_REQ_BUF_SIZE,
-                        "Chunk store queue full, dropping requests."
-                    );
-                    self.store_dropped_count.store(0, Ordering::Relaxed);
-                });
+        let (Some(tx), Some(budget)) = (&self.store_tx, &self.store_budget) else {
+            return;
+        };
+        let message = if let Some(permit) = budget.try_reserve(data.capacity()) {
+            let req = ChunkStoreRequest {
+                checksum: cs,
+                data,
+                deadline: Instant::now() + CACHE_WRITE_MAX_AGE,
+                permit,
+            };
+            if tx.try_send(req).is_ok() {
+                return;
             }
-        }
+            "Chunk store queue full, dropping requests."
+        } else {
+            drop(data);
+            "Chunk store byte budget unavailable, dropping requests."
+        };
+        self.store_dropped_count.fetch_add(1, Ordering::Relaxed);
+        rate_limited_log!(self.store_warn_limiter, {
+            let dropped = self.store_dropped_count.swap(0, Ordering::Relaxed);
+            warn!(
+                dropped_count = dropped,
+                queue_size = CHUNK_STORE_REQ_BUF_SIZE,
+                "{message}"
+            );
+        });
     }
 
     #[cfg(target_os = "linux")]
@@ -798,6 +850,7 @@ impl fuse_backend_rs::api::filesystem::FileSystem for NydusImage {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for NydusImage {
     fn drop(&mut self) {
         // Drop the sender to signal the worker thread to exit
@@ -809,5 +862,45 @@ impl Drop for NydusImage {
                 let _ = handle.join();
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_full_pauses_later_backfill_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            ChunkDB::new_with_size_and_index_ctl(dir.path(), Some(8 << 20), None).unwrap(),
+        );
+        let slot_bytes = 16 << 20;
+        let budget = CacheWriteBudget::new(dir.path(), 1, slot_bytes).unwrap();
+        let (tx, rx) = mpsc::sync_channel(CHUNK_STORE_BATCH_SIZE + 1);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let enqueue = |data: Vec<u8>| {
+            let checksum = CheckSum::from_data(&data, CheckSumMethod::Blake3);
+            let permit = budget.try_reserve(data.capacity()).unwrap();
+            tx.send(ChunkStoreRequest {
+                checksum,
+                data,
+                deadline,
+                permit,
+            })
+            .unwrap();
+            checksum
+        };
+
+        enqueue(vec![0; 9 << 20]);
+        for _ in 1..CHUNK_STORE_BATCH_SIZE {
+            enqueue(vec![1]);
+        }
+        // This chunk would fit if the next batch immediately retried LMDB.
+        let next = enqueue(vec![2]);
+        drop(tx);
+        ChunkStoreWorker::new(db.clone(), rx).run();
+        assert!(!db.has_chunk(&next).unwrap());
+        assert!(budget.try_reserve(slot_bytes).is_some());
     }
 }

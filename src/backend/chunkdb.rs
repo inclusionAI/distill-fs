@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(target_os = "linux")]
+use super::cache_write_budget::CacheWritePermit;
 use super::slow_write_txn;
 use crate::utils::now_epoch_secs;
 use bytemuck::{Pod, Zeroable};
@@ -424,6 +426,14 @@ impl std::fmt::Debug for ChunkDB {
 use std::collections::VecDeque;
 use std::sync::mpsc;
 
+struct ChunkBatch {
+    chunks: Vec<(CheckSum, Vec<u8>)>,
+    deadline: Option<Instant>,
+    #[cfg(target_os = "linux")]
+    // Drop the payloads before returning their reservations.
+    _permits: Vec<CacheWritePermit>,
+}
+
 enum WriteRequest {
     AddChunk {
         cs: CheckSum,
@@ -431,7 +441,7 @@ enum WriteRequest {
         reply: mpsc::SyncSender<anyhow::Result<()>>,
     },
     AddChunksBatch {
-        chunks: Vec<(CheckSum, Vec<u8>)>,
+        batch: ChunkBatch,
         reply: mpsc::SyncSender<anyhow::Result<()>>,
     },
     DeleteKeys {
@@ -454,6 +464,8 @@ struct WriteQueue {
 struct WriterChannel {
     inner: Mutex<WriteQueue>,
     cond: Condvar,
+    #[cfg(test)]
+    before_batch_write_txn: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl Default for WriterChannel {
@@ -461,6 +473,8 @@ impl Default for WriterChannel {
         Self {
             inner: Mutex::new(WriteQueue::default()),
             cond: Condvar::new(),
+            #[cfg(test)]
+            before_batch_write_txn: Mutex::new(None),
         }
     }
 }
@@ -557,8 +571,9 @@ impl WriterThread {
                     let result = self.do_add_chunk(&cs, &data);
                     let _ = reply.send(result);
                 }
-                WriteRequest::AddChunksBatch { chunks, reply } => {
-                    let result = self.do_add_chunks_batch(&chunks);
+                WriteRequest::AddChunksBatch { batch, reply } => {
+                    let result = self.do_add_chunks_batch(&batch);
+                    drop(batch);
                     let _ = reply.send(result);
                 }
                 _ => unreachable!(),
@@ -658,53 +673,68 @@ impl WriterThread {
         }
     }
 
-    fn do_add_chunks_batch(&self, chunks: &[(CheckSum, Vec<u8>)]) -> anyhow::Result<()> {
-        for batch in chunks.chunks(ADD_CHUNKS_BATCH_SIZE) {
-            self.do_add_chunks_sub_batch(batch)?;
+    fn do_add_chunks_batch(&self, batch: &ChunkBatch) -> anyhow::Result<()> {
+        for chunks in batch.chunks.chunks(ADD_CHUNKS_BATCH_SIZE) {
+            self.do_add_chunks_sub_batch(chunks, batch.deadline)?;
         }
         Ok(())
     }
 
-    fn do_add_chunks_sub_batch(&self, batch: &[(CheckSum, Vec<u8>)]) -> anyhow::Result<()> {
-        loop {
-            let mut wtxn = slow_write_txn(&self.env, "WriterThread::add_chunks")?;
-            let mut map_full = false;
-            for (cs, data) in batch {
-                let cs_on_disk = CheckSumOnDisk::from(*cs);
-                match self.data_db.get_or_put_reserved(
-                    &mut wtxn,
-                    &cs_on_disk,
-                    data.len(),
-                    |reserved| reserved.write_all(data),
-                ) {
-                    Ok(None) | Ok(Some(_)) => {}
-                    Err(heed::Error::Mdb(MdbError::MapFull)) => {
-                        map_full = true;
-                        break;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+    fn do_add_chunks_sub_batch(
+        &self,
+        batch: &[(CheckSum, Vec<u8>)],
+        deadline: Option<Instant>,
+    ) -> anyhow::Result<()> {
+        let check_deadline = || {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "Cache backfill expired",
+                ));
             }
-            if !map_full {
-                wtxn.commit()?;
-                // Register immediately after commit so that even if a later
-                // sub-batch fails, these already-durable chunks are visible
-                // in the chunk index.
-                if let Some(ctl) = &self.index_ctl {
-                    let checksums: Vec<CheckSum> = batch.iter().map(|(cs, _)| *cs).collect();
-                    let _ = ctl.register_chunks(&checksums);
+            Ok(())
+        };
+        loop {
+            check_deadline()?;
+            #[cfg(test)]
+            if let Some(ready) = self.channel.before_batch_write_txn.lock().unwrap().take() {
+                let _ = ready.send(());
+            }
+            let mut wtxn = slow_write_txn(&self.env, "WriterThread::add_chunks")?;
+            check_deadline()?;
+            let result = batch.iter().try_for_each(|(cs, data)| {
+                let cs_on_disk = CheckSumOnDisk::from(*cs);
+                self.data_db
+                    .get_or_put_reserved(&mut wtxn, &cs_on_disk, data.len(), |reserved| {
+                        reserved.write_all(data)
+                    })
+                    .map(drop)
+            });
+            match result {
+                Ok(()) => {
+                    wtxn.commit()?;
+                    break;
                 }
-                self.channel
-                    .enqueue_access_many(batch.iter().map(|(cs, _)| CheckSumOnDisk::from(*cs)));
-                return Ok(());
-            } else {
-                drop(wtxn);
-                let removed = self.gc_lru_direct(GC_BATCH)?;
-                if removed == 0 {
-                    return Err(heed::Error::Mdb(MdbError::MapFull).into());
+                Err(heed::Error::Mdb(MdbError::MapFull)) if deadline.is_none() => {
+                    // Explicit batch writes retain synchronous reclamation.
+                    drop(wtxn);
+                    if self.gc_lru_direct(GC_BATCH)? == 0 {
+                        return Err(heed::Error::Mdb(MdbError::MapFull).into());
+                    }
                 }
+                // Optional backfill leaves reclamation to periodic GC.
+                Err(e) => return Err(e.into()),
             }
         }
+
+        // A later sub-batch may fail. Publish each committed sub-batch immediately.
+        if let Some(ctl) = &self.index_ctl {
+            let checksums: Vec<CheckSum> = batch.iter().map(|(cs, _)| *cs).collect();
+            let _ = ctl.register_chunks(&checksums);
+        }
+        self.channel
+            .enqueue_access_many(batch.iter().map(|(cs, _)| CheckSumOnDisk::from(*cs)));
+        Ok(())
     }
 
     fn do_delete_keys(&self, keys: Vec<AccessKey>) -> anyhow::Result<GcDeleteResult> {
@@ -910,15 +940,43 @@ impl ChunkDB {
     }
 
     pub fn add_chunks(&self, chunks: Vec<(CheckSum, Vec<u8>)>) -> anyhow::Result<()> {
-        if chunks.is_empty() {
+        self.submit_chunks(ChunkBatch {
+            chunks,
+            deadline: None,
+            #[cfg(target_os = "linux")]
+            _permits: Vec::new(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn path(&self) -> &Path {
+        self.env.path()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn add_cache_chunks(
+        &self,
+        chunks: Vec<(CheckSum, Vec<u8>)>,
+        permits: Vec<CacheWritePermit>,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        self.submit_chunks(ChunkBatch {
+            chunks,
+            deadline: Some(deadline),
+            _permits: permits,
+        })
+    }
+
+    fn submit_chunks(&self, batch: ChunkBatch) -> anyhow::Result<()> {
+        if batch.chunks.is_empty() {
             return Ok(());
         }
-        let total_bytes: u64 = chunks.iter().map(|(_, data)| data.len() as u64).sum();
-        let chunk_count = chunks.len() as u64;
+        let total_bytes: u64 = batch.chunks.iter().map(|(_, data)| data.len() as u64).sum();
+        let chunk_count = batch.chunks.len() as u64;
 
         let (tx, rx) = mpsc::sync_channel(1);
         self.writer_channel
-            .submit_high(WriteRequest::AddChunksBatch { chunks, reply: tx });
+            .submit_high(WriteRequest::AddChunksBatch { batch, reply: tx });
         let result: anyhow::Result<()> = rx
             .recv()
             .map_err(|_| anyhow::anyhow!("Writer thread dropped"))?;
