@@ -18,9 +18,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use distill_fs::backend::chunkdb::{CheckSum, CheckSumMethod, ChunkDB};
+use distill_fs::backend::indexdb::IndexDB;
 use fuse_backend_rs::api::filesystem::{Context, FileSystem, ZeroCopyWriter};
 
 fn init_tracing() {
@@ -204,8 +207,18 @@ fn nydus_direct_reads_file() {
     let temp = tempfile::TempDir::new().unwrap();
     let expected = b"distill-fs nydus mount\n";
     let (bootstrap, config) = build_nydus_fixture(&nydus_image, &temp, expected);
-    let image =
-        distill_fs::image::nydus::NydusImage::new(&bootstrap, &config, "", None, None).unwrap();
+    let chunk_dir = tempfile::TempDir::new_in(temp.path()).unwrap();
+    let index_dir = tempfile::TempDir::new_in(temp.path()).unwrap();
+    let chunk_db = Arc::new(ChunkDB::new(chunk_dir.path()).unwrap());
+    let index_db = Arc::new(IndexDB::open(index_dir.path()).unwrap());
+    let image = distill_fs::image::nydus::NydusImage::new(
+        &bootstrap,
+        &config,
+        "",
+        Some((chunk_db.clone(), index_db)),
+        None,
+    )
+    .unwrap();
 
     let ctx = Context::new();
     let name = std::ffi::CString::new("hello.txt").unwrap();
@@ -227,6 +240,9 @@ fn nydus_direct_reads_file() {
         .unwrap();
     assert_eq!(n, expected.len());
     assert_eq!(writer.data, expected);
+    drop(image);
+    let checksum = CheckSum::from_data(expected, CheckSumMethod::Blake3);
+    assert!(chunk_db.has_chunk(&checksum).unwrap());
 }
 
 #[test]

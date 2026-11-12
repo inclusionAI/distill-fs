@@ -20,6 +20,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 pub mod cache;
+#[cfg(target_os = "linux")]
+pub(crate) mod cache_write_budget;
 pub mod chunkdb;
 pub mod dedup;
 pub mod general;

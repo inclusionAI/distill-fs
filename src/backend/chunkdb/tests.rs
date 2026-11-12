@@ -38,6 +38,32 @@ fn wait_for_access_time(db: &ChunkDB, cs: &CheckSumOnDisk) -> Option<u64> {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn expired_cache_backfill_releases_its_reservation() {
+    use crate::backend::cache_write_budget::CacheWriteBudget;
+
+    let dir = TempDir::new().unwrap();
+    let db = ChunkDB::new(dir.path()).unwrap();
+    let data = vec![1; 1024];
+    let checksum = CheckSum::from_data(&data, CheckSumMethod::Blake3);
+    let bytes = data.capacity();
+    let budget = CacheWriteBudget::new(dir.path(), 1, bytes).unwrap();
+    let other = CacheWriteBudget::new(dir.path(), 1, bytes).unwrap();
+    let permit = budget.try_reserve(bytes).unwrap();
+    assert!(other.try_reserve(1).is_none());
+
+    let err = db
+        .add_cache_chunks(vec![(checksum, data)], vec![permit], Instant::now())
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<io::Error>().unwrap().kind(),
+        ErrorKind::TimedOut
+    );
+    assert!(!db.has_chunk(&checksum).unwrap());
+    assert!(budget.try_reserve(bytes).is_some());
+}
+
 #[derive(Debug, Default)]
 struct RecordingChunkIndex {
     registered: Arc<Mutex<Vec<CheckSum>>>,
@@ -582,6 +608,77 @@ fn test_add_chunks_registers_per_sub_batch() {
     let mut expected_sorted = expected;
     expected_sorted.sort();
     assert_eq!(registered, expected_sorted);
+}
+
+#[test]
+fn batch_map_full_skips_gc_and_preserves_committed_chunks() {
+    let temp = TempDir::new().unwrap();
+    let control = Arc::new(RecordingChunkIndex::default());
+    let db =
+        ChunkDB::new_with_size_and_index_ctl(temp.path(), Some(8 << 20), Some(control.clone()))
+            .unwrap();
+    let cached = CheckSum::from_data(b"cached", CheckSumMethod::Blake3);
+    db.add_chunk(&cached, b"cached".to_vec()).unwrap();
+    assert!(wait_for_access_time(&db, &CheckSumOnDisk::from(cached)).is_some());
+
+    let mut chunks: Vec<_> = (0..ADD_CHUNKS_BATCH_SIZE)
+        .map(|i| {
+            let data = format!("committed-{i}").into_bytes();
+            (CheckSum::from_data(&data, CheckSumMethod::Blake3), data)
+        })
+        .collect();
+    let mut registered = vec![cached];
+    registered.extend(chunks.iter().map(|(cs, _)| *cs));
+
+    let pending = b"uncommitted".to_vec();
+    let pending_cs = CheckSum::from_data(&pending, CheckSumMethod::Blake3);
+    let oversized = vec![42; 9 << 20];
+    let oversized_cs = CheckSum::from_data(&oversized, CheckSumMethod::Blake3);
+    chunks.extend([(pending_cs, pending), (oversized_cs, oversized)]);
+
+    let bytes = chunks.iter().map(|(_, data)| data.capacity()).sum();
+    let budget =
+        crate::backend::cache_write_budget::CacheWriteBudget::new(temp.path(), 1, bytes).unwrap();
+    let permit = budget.try_reserve(bytes).unwrap();
+    let err = db
+        .add_cache_chunks(
+            chunks,
+            vec![permit],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<heed::Error>(),
+        Some(heed::Error::Mdb(MdbError::MapFull))
+    ));
+    assert_eq!(control.registered(), registered);
+    assert!(control.unregistered().is_empty());
+    for cs in registered {
+        assert!(db.has_chunk(&cs).unwrap());
+    }
+    assert!(!db.has_chunk(&pending_cs).unwrap());
+    assert!(!db.has_chunk(&oversized_cs).unwrap());
+    assert!(budget.try_reserve(bytes).is_some());
+}
+
+#[test]
+fn explicit_batch_write_runs_gc_on_map_full() {
+    let temp = TempDir::new().unwrap();
+    let db = ChunkDB::new_with_size_and_index_ctl(temp.path(), Some(8 << 20), None).unwrap();
+    let cached = b"cached";
+    let cached_cs = CheckSum::from_data(cached, CheckSumMethod::Blake3);
+    db.add_chunk(&cached_cs, cached.to_vec()).unwrap();
+    assert!(wait_for_access_time(&db, &CheckSumOnDisk::from(cached_cs)).is_some());
+
+    let oversized = vec![42; 9 << 20];
+    let oversized_cs = CheckSum::from_data(&oversized, CheckSumMethod::Blake3);
+    let err = db.add_chunks(vec![(oversized_cs, oversized)]).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<heed::Error>(),
+        Some(heed::Error::Mdb(MdbError::MapFull))
+    ));
+    assert!(!db.has_chunk(&cached_cs).unwrap());
+    assert!(!db.has_chunk(&oversized_cs).unwrap());
 }
 
 #[test]
